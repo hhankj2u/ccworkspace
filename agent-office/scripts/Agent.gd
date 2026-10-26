@@ -1551,6 +1551,8 @@ func set_meeting_table_position(pos: Vector2) -> void:
 
 func set_description(desc: String) -> void:
 	description = desc
+	if visuals and agent_type == "orchestrator":
+		visuals.set_session_label(desc)
 	if visuals and visuals.status_label:
 		if desc.length() > 25:
 			visuals.status_label.text = desc.substr(0, 22) + "..."

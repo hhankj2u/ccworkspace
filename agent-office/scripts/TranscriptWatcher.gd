@@ -12,7 +12,7 @@ const CLAWDBOT_SESSIONS_DIR = "/.clawdbot/agents"
 const CLAWDBOT_MAX_SCAN_DEPTH = 3  # agents/<agent>/sessions/*.jsonl
 const POLL_INTERVAL = OfficeConstants.TRANSCRIPT_POLL_INTERVAL
 const SCAN_INTERVAL = 1.0  # seconds - how often to scan for new sessions (fast to catch subagent sessions)
-const ACTIVE_THRESHOLD = 300  # seconds - consider sessions active if modified within this time (longer than SESSION_INACTIVE_TIMEOUT)
+const ACTIVE_THRESHOLD = 1800  # seconds - consider sessions active if modified within this time (longer than SESSION_INACTIVE_TIMEOUT)
 const PENDING_AGENT_TIMEOUT = 1800  # seconds - consider pending agents stale after this long without updates
 const WATCHER_CONFIG_FILE = "user://watchers.json"
 const MAX_BYTES_PER_POLL = 1048576
@@ -422,8 +422,10 @@ func start_watching_session(file_path: String, harness: String = "") -> void:
 	# Open file and seek to end
 	var file = FileAccess.open(file_path, FileAccess.READ)
 	if file:
+		var title = _read_session_title(file)
 		file.seek_end(0)
 		watched_sessions[file_path] = {
+			"title": title,
 			"position": file.get_position(),
 			"last_modified": FileAccess.get_modified_time(file_path),
 			"harness_id": harness if not harness.is_empty() else _derive_harness(file_path),
@@ -441,6 +443,62 @@ func start_watching_session(file_path: String, harness: String = "") -> void:
 		call_deferred("_emit_session_start", session_id, file_path)
 	else:
 		push_warning("[TranscriptWatcher] Cannot open: %s" % file_path)
+
+const ALERT_MAX_AGE_SEC = 60.0  # Don't chime for old entries replayed after a file rewrite
+const ATTENTION_TOOLS = ["AskUserQuestion", "ExitPlanMode"]
+
+func _check_session_alert(entry: Dictionary, message: Dictionary, session_path: String) -> void:
+	# Main Claude session only - subagent (sidechain) turns don't need the user
+	if entry.get("type", "") != "assistant" or entry.get("isSidechain", false):
+		return
+	if session_path.replace("\\", "/").contains("/subagents/"):
+		return
+	var stamp = str(entry.get("timestamp", "")).left(19)
+	if not stamp.is_empty():
+		var age = Time.get_unix_time_from_system() - Time.get_unix_time_from_datetime_string(stamp)
+		if age > ALERT_MAX_AGE_SEC:
+			return
+	var kind = ""
+	var content = message.get("content", [])
+	if content is Array:
+		for block in content:
+			if block is Dictionary and block.get("type", "") == "tool_use" and str(block.get("name", "")) in ATTENTION_TOOLS:
+				kind = "attention"
+	if kind.is_empty() and message.get("stop_reason", "") == "end_turn":
+		kind = "done"
+	if kind.is_empty():
+		return
+	call_deferred("_emit_event", {
+		"event": "session_alert",
+		"kind": kind,
+		"session_id": _derive_session_id(session_path),
+		"session_path": session_path
+	})
+
+const TITLE_SCAN_BYTES = 524288  # Claude Code re-appends custom-title often, so the tail is enough
+
+func _read_session_title(file: FileAccess) -> String:
+	var length = file.get_length()
+	var start = maxi(0, length - TITLE_SCAN_BYTES)
+	file.seek(start)
+	var text = file.get_buffer(length - start).get_string_from_utf8()
+	var lines = text.split("\n", false)
+	for i in range(lines.size() - 1, -1, -1):
+		var line: String = lines[i]
+		if not line.contains("\"custom-title\""):
+			continue
+		var entry = JSON.parse_string(line)
+		if entry is Dictionary and entry.get("type", "") == "custom-title":
+			return _sanitize_title(entry.get("customTitle", ""))
+	return ""
+
+func _sanitize_title(value) -> String:
+	return str(value).strip_edges().replace("\n", " ").left(MAX_DESCRIPTION_CHARS)
+
+func get_session_title(session_path: String) -> String:
+	if watched_sessions.has(session_path):
+		return str(watched_sessions[session_path].get("title", ""))
+	return ""
 
 func _emit_event(data: Dictionary) -> void:
 	## Helper for deferred emission - breaks synchronous cascades that can cause X11 threading issues.
@@ -470,6 +528,7 @@ func _emit_session_start(session_id: String, session_path: String) -> void:
 		"event": "session_start",
 		"session_id": session_id,
 		"session_path": session_path,
+		"session_title": get_session_title(session_path),
 		"harness_id": harness,
 		"harness_label": harness.capitalize() if harness else "",
 		"timestamp": Time.get_datetime_string_from_system()
@@ -601,6 +660,7 @@ func check_session_for_entries(file_path: String) -> void:
 			"event": "session_activity",
 			"session_id": session_id,
 			"session_path": file_path,
+			"session_title": get_session_title(file_path),
 			"harness_id": harness,
 			"harness_label": harness.capitalize() if harness else "",
 			"timestamp": Time.get_datetime_string_from_system()
@@ -666,6 +726,19 @@ func process_line(line: String, session_path: String = "") -> void:
 			session_context_entries[session_path] = session_context_entries[session_path].slice(-MAX_CONTEXT_ENTRIES)
 		call_deferred("_emit_context_updated", session_path, get_context_percent(session_path))
 
+	# Claude Code session renamed (desktop app / /rename) - update the label
+	if entry.get("type", "") == "custom-title" and not session_path.is_empty():
+		var new_title = _sanitize_title(entry.get("customTitle", ""))
+		if watched_sessions.has(session_path) and new_title != watched_sessions[session_path].get("title", ""):
+			watched_sessions[session_path]["title"] = new_title
+			call_deferred("_emit_event", {
+				"event": "session_title",
+				"session_id": _derive_session_id(session_path),
+				"session_path": session_path,
+				"session_title": new_title
+			})
+		return
+
 	if _process_codex_entry(entry, session_path):
 		return
 	if _process_clawdbot_entry(entry, session_path):
@@ -702,6 +775,8 @@ func process_line(line: String, session_path: String = "") -> void:
 	var message = entry.get("message", {})
 	if not message is Dictionary:
 		return
+
+	_check_session_alert(entry, message, session_path)
 
 	var content = message.get("content", [])
 	if not content is Array:

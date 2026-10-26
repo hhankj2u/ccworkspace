@@ -1464,6 +1464,13 @@ func _on_event_received(event_data: Dictionary) -> void:
 	if event_type == "session_activity":
 		_handle_session_activity(event_data)
 		return
+	if event_type == "session_title":
+		_handle_session_title(event_data)
+		return
+	if event_type == "session_alert":
+		if audio_manager:
+			audio_manager.play_alert(str(event_data.get("kind", "")))
+		return
 
 	# Update status
 	var tool_name = event_data.get("tool", "")
@@ -1522,7 +1529,7 @@ func _handle_session_start(data: Dictionary) -> void:
 		var orch_data = {
 			"agent_id": "orch_" + short_id,
 			"agent_type": "orchestrator",
-			"description": "Session: " + short_id,
+			"description": _session_description(data, short_id),
 			"session_path": session_path,
 			"harness_id": harness_id,
 			"harness_label": harness_label,
@@ -1530,6 +1537,22 @@ func _handle_session_start(data: Dictionary) -> void:
 		}
 		_handle_agent_spawn(orch_data)
 		_update_taskboard()
+
+func _session_description(data: Dictionary, short_id: String) -> String:
+	# Prefer the session's name (Claude Code custom-title) over its short ID
+	var title = str(data.get("session_title", "")).strip_edges()
+	return title if not title.is_empty() else "Session: " + short_id
+
+func _handle_session_title(data: Dictionary) -> void:
+	var session_id = data.get("session_id", "")
+	if not session_id:
+		return
+	var short_id = _get_session_short_id(session_id)
+	var orch_id = "orch_" + short_id
+	if active_agents.has(orch_id):
+		var orchestrator = active_agents[orch_id] as Agent
+		if orchestrator and is_instance_valid(orchestrator):
+			orchestrator.set_description(_session_description(data, short_id))
 
 func _handle_session_end(data: Dictionary) -> void:
 	var session_id = data.get("session_id", "")
@@ -1593,7 +1616,7 @@ func _handle_session_activity(data: Dictionary) -> void:
 		var orch_data = {
 			"agent_id": orch_id,
 			"agent_type": "orchestrator",
-			"description": "Session: " + _get_session_short_id(session_id),
+			"description": _session_description(data, _get_session_short_id(session_id)),
 			"session_path": session_path,
 			"harness_id": harness_id,
 			"harness_label": harness_label,

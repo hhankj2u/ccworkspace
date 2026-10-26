@@ -24,6 +24,7 @@ var status_label: Label = null
 var tool_label: Label = null
 var tool_bg: ColorRect = null
 var tooltip_panel: PanelContainer = null
+var session_label: Label = null  # Always-visible session name under orchestrators
 var tooltip_label: Label = null
 var tooltip_header: Label = null
 var tooltip_subtitle: Label = null
@@ -129,7 +130,35 @@ func _ensure_ui_nodes() -> void:
 	tool_label.visible = false
 	agent.add_child(tool_label)
 
+	session_label = Label.new()
+	session_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	session_label.add_theme_font_size_override("font_size", 10)
+	session_label.add_theme_color_override("font_color", OfficePalette.UI_TEXT_LIGHT)
+	var session_style = StyleBoxFlat.new()
+	session_style.bg_color = OfficePalette.UI_BG_DARK
+	session_style.content_margin_left = 4
+	session_style.content_margin_right = 4
+	session_label.add_theme_stylebox_override("normal", session_style)
+	session_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	session_label.z_as_relative = false
+	session_label.z_index = OfficeConstants.Z_UI - 10  # Above agents/desks, below tooltips
+	session_label.visible = false
+	agent.add_child(session_label)
+
 	_create_tooltip()
+
+const SESSION_LABEL_MAX_CHARS = 32
+
+func set_session_label(text: String) -> void:
+	if not session_label:
+		return
+	if text.is_empty():
+		session_label.visible = false
+		return
+	session_label.text = text if text.length() <= SESSION_LABEL_MAX_CHARS else text.left(SESSION_LABEL_MAX_CHARS - 3) + "..."
+	session_label.reset_size()
+	session_label.position = Vector2(-session_label.size.x / 2.0, 40)
+	session_label.visible = true
 
 func _create_tooltip() -> void:
 	# Use a PanelContainer for auto-sizing
@@ -400,6 +429,8 @@ func _clear_visual_nodes() -> void:
 		preserve_nodes.append(tool_bg)
 	if tooltip_panel and is_instance_valid(tooltip_panel):
 		preserve_nodes.append(tooltip_panel)
+	if session_label and is_instance_valid(session_label):
+		preserve_nodes.append(session_label)
 
 	var status_bg = agent.get_node_or_null("StatusBg")
 	if status_bg:

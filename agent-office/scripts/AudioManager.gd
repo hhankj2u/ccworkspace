@@ -50,6 +50,15 @@ const SETTINGS_FILE: String = "user://audio_settings.json"
 var sounds_enabled: bool = true
 var sounds_loaded: bool = false
 
+# Session alerts (turn done / needs attention) - independent of sounds_enabled
+var alerts_enabled: bool = true
+var alert_volume: float = 0.8
+var alert_player: AudioStreamPlayer
+var alert_streams: Dictionary = {}  # kind -> AudioStreamWAV
+const DEFAULT_ALERT_VOLUME_DB: float = -6.0
+const ALERT_COOLDOWN_MSEC: int = 1500
+var _last_alert_msec: int = -ALERT_COOLDOWN_MSEC
+
 func _ready() -> void:
 	_register_with_settings()
 	_setup_audio_players()
@@ -67,7 +76,9 @@ func _register_with_settings() -> void:
 		{"key": "meow_volume", "type": "float", "default": 0.7, "min": 0.0, "max": 1.0, "description": "Cat meow volume"},
 		{"key": "achievement_volume", "type": "float", "default": 0.8, "min": 0.0, "max": 1.0, "description": "Achievement sound volume"},
 		{"key": "office_volume", "type": "float", "default": 0.6, "min": 0.0, "max": 1.0, "description": "Office sounds volume (shredder, filing)"},
-		{"key": "sounds_enabled", "type": "bool", "default": true, "description": "Enable/disable all sounds"}
+		{"key": "sounds_enabled", "type": "bool", "default": true, "description": "Enable/disable all sounds"},
+		{"key": "alerts_enabled", "type": "bool", "default": true, "description": "Chime when a session finishes or needs attention"},
+		{"key": "alert_volume", "type": "float", "default": 0.8, "min": 0.0, "max": 1.0, "description": "Session alert volume"}
 	]
 
 	registry.register_category("audio", SETTINGS_FILE, schema, _on_setting_changed)
@@ -83,6 +94,10 @@ func _register_with_settings() -> void:
 	office_volume = v_office if v_office != null else 0.6
 	var v_enabled = registry.get_setting("audio", "sounds_enabled")
 	sounds_enabled = v_enabled if v_enabled != null else true
+	var v_alerts = registry.get_setting("audio", "alerts_enabled")
+	alerts_enabled = v_alerts if v_alerts != null else true
+	var v_alert_vol = registry.get_setting("audio", "alert_volume")
+	alert_volume = v_alert_vol if v_alert_vol != null else 0.8
 
 func _on_setting_changed(key: String, value: Variant) -> void:
 	match key:
@@ -106,6 +121,12 @@ func _on_setting_changed(key: String, value: Variant) -> void:
 				filing_player.volume_db = _volume_to_db(office_volume, DEFAULT_OFFICE_VOLUME_DB)
 		"sounds_enabled":
 			sounds_enabled = bool(value)
+		"alerts_enabled":
+			alerts_enabled = bool(value)
+		"alert_volume":
+			alert_volume = float(value)
+			if alert_player:
+				alert_player.volume_db = _volume_to_db(alert_volume, DEFAULT_ALERT_VOLUME_DB)
 
 func _setup_audio_players() -> void:
 	typing_player = AudioStreamPlayer.new()
@@ -134,6 +155,15 @@ func _setup_audio_players() -> void:
 	filing_player.volume_db = _volume_to_db(office_volume, DEFAULT_OFFICE_VOLUME_DB)
 	filing_player.bus = "Master"
 	add_child(filing_player)
+
+	alert_player = AudioStreamPlayer.new()
+	alert_player.volume_db = _volume_to_db(alert_volume, DEFAULT_ALERT_VOLUME_DB)
+	alert_player.bus = "Master"
+	add_child(alert_player)
+	# Synthesized so no extra asset/import is needed.
+	# done: rising two-note chime (E6 -> A6); attention: three quick B5 pings
+	alert_streams["done"] = _make_chime([[1318.5, 0.0, 0.35], [1760.0, 0.12, 0.5]], 0.65)
+	alert_streams["attention"] = _make_chime([[987.8, 0.0, 0.12], [987.8, 0.16, 0.12], [987.8, 0.32, 0.25]], 0.6)
 
 func _load_sounds() -> void:
 	# Try to load sounds - they may not exist yet
@@ -218,6 +248,47 @@ func play_filing() -> void:
 		return
 	filing_player.pitch_scale = randf_range(0.9, 1.1)
 	filing_player.play()
+
+# Called when a session finishes its turn ("done") or asks the user something ("attention")
+func play_alert(kind: String) -> void:
+	if not alerts_enabled or not alert_streams.has(kind):
+		return
+	var now = Time.get_ticks_msec()
+	if now - _last_alert_msec < ALERT_COOLDOWN_MSEC:
+		return
+	_last_alert_msec = now
+	alert_player.stream = alert_streams[kind]
+	alert_player.play()
+
+# notes: [[frequency_hz, start_sec, length_sec], ...]
+func _make_chime(notes: Array, total_sec: float) -> AudioStreamWAV:
+	var mix_rate = 44100
+	var frames = int(total_sec * mix_rate)
+	var samples = PackedFloat32Array()
+	samples.resize(frames)
+	for note in notes:
+		var freq: float = note[0]
+		var start = int(note[1] * mix_rate)
+		var length = int(note[2] * mix_rate)
+		for i in range(length):
+			var idx = start + i
+			if idx >= frames:
+				break
+			var t = float(i) / mix_rate
+			var attack = minf(1.0, t / 0.005)
+			var env = attack * exp(-t * 9.0)
+			# Fundamental plus a soft octave for a bell-like tone
+			samples[idx] += env * (sin(TAU * freq * t) + 0.3 * sin(TAU * freq * 2.0 * t))
+	var data = PackedByteArray()
+	data.resize(frames * 2)
+	for i in range(frames):
+		data.encode_s16(i * 2, int(clampf(samples[i] * 0.45, -1.0, 1.0) * 32767.0))
+	var stream = AudioStreamWAV.new()
+	stream.format = AudioStreamWAV.FORMAT_16_BITS
+	stream.mix_rate = mix_rate
+	stream.stereo = false
+	stream.data = data
+	return stream
 
 func set_sounds_enabled(enabled: bool) -> void:
 	var registry = get_node_or_null("/root/SettingsRegistry")
